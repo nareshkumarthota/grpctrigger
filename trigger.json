@@ -1,0 +1,66 @@
+{
+  "name": "tibco-gateway-grpc",
+  "type": "mashling:trigger",
+  "ref": "github.com/nareshkumarthota/grpctrigger",
+  "version": "0.0.1",
+  "title": "gRPC Trigger Usage",
+  "author": "Naresh Kumar Thota <nthota@tibco.com>",
+  "description": "Simple gRPC Trigger for mashling gateway",
+  "settings": [
+    {
+      "name": "port",
+      "type": "integer",
+      "required": true
+    },
+    {
+      "name": "enableTLS",
+      "type": "boolean"
+    },
+    {
+      "name": "serverCert",
+      "type": "string"
+    },
+    {
+      "name": "serverKey",
+      "type": "string"
+    },
+    {
+      "name": "enableClientAuth",
+      "type": "string"
+    },
+    {
+      "name": "trustStore",
+      "type": "string"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "params",
+      "type": "params"
+    },
+    {
+      "name": "pathParams",
+      "type": "params"
+    },
+    {
+      "name": "queryParams",
+      "type": "params"
+    },
+    {
+      "name": "content",
+      "type": "any"
+    }
+  ],
+  "handler": {
+    "settings": [
+      {
+        "name": "autoIdReply",
+        "type": "boolean"
+      },
+      {
+        "name": "useReplyHandler",
+        "type": "boolean"
+      }
+    ]
+  }
+}
