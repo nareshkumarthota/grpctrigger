@@ -89,7 +89,9 @@ func (t *GRPCTrigger) Start() error {
 
 	log.Println("Starting server on port: ", addr)
 
-	go s.Serve(lis)
+	go func() {
+		s.Serve(lis)
+	}()
 
 	log.Println("Server started")
 	return nil
