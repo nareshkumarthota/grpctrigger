@@ -94,6 +94,25 @@ func (t *GRPCTrigger) Start() error {
 	}()
 
 	log.Println("Server started")
+
+	actionId := t.config.Handlers[0].ActionId
+	handlerCfg := t.config.Handlers[0]
+	action := action.Get(actionId)
+
+	data := map[string]interface{}{}
+
+	startAttrs, _ := t.metadata.OutputsToAttrs(data, false)
+
+	context := trigger.NewContextWithData(context.Background(), &trigger.ContextData{Attrs: startAttrs, HandlerCfg: handlerCfg})
+
+	replyCode, replyData, err := t.runner.Run(context, action, actionId, nil)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println("@@@@@@@@", replyCode, "data", replyData)
+
 	return nil
 }
 
