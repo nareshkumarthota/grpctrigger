@@ -1,22 +1,29 @@
-package grpctrigger
+package grpc
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"io"
-	"log"
 	"net"
+	"reflect"
+	"strconv"
+	"strings"
+
+	"github.com/TIBCOSoftware/flogo-lib/logger"
+	"google.golang.org/grpc/credentials"
 
 	"github.com/TIBCOSoftware/flogo-lib/core/action"
 	"github.com/TIBCOSoftware/flogo-lib/core/trigger"
-	"github.com/nareshkumarthota/grpctrigger/pb"
-	"golang.org/x/net/context"
+	"github.com/TIBCOSoftware/mashling/lib/util"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/metadata"
 )
 
 var addr string
+
+const settingDest = "dest"
+
+// log is the default package logger
+var log = logger.GetLogger("trigger-tibco-grpc")
 
 //GRPCTriggerFactory gRPC Trigger factory
 type GRPCTriggerFactory struct {
@@ -33,11 +40,21 @@ func (t *GRPCTriggerFactory) New(config *trigger.Config) trigger.Trigger {
 	return &GRPCTrigger{metadata: t.metadata, config: config}
 }
 
-// GRPCTrigger is a stub for your Trigger implementation
+//GRPCTrigger is a stub for your Trigger implementation
 type GRPCTrigger struct {
 	metadata *trigger.Metadata
 	runner   action.Runner
 	config   *trigger.Config
+	handlers map[string]*OptimizedHandler
+	server   *grpc.Server
+	TLSConfig
+}
+
+//TLSConfig is stub for tls support
+type TLSConfig struct {
+	enableTLS bool
+	serveKey  string
+	serveCert string
 }
 
 // Init implements trigger.Trigger.Init
@@ -55,6 +72,38 @@ func (t *GRPCTrigger) Init(runner action.Runner) {
 
 	t.runner = runner
 
+	t.handlers = t.CreateHandlers()
+
+	//Check whether TLS (Transport Layer Security) is enabled for the trigger
+	enableTLS := false
+	serverCert := ""
+	serverKey := ""
+	if _, ok := t.config.Settings["enableTLS"]; ok {
+		enableTLSSetting, err := strconv.ParseBool(t.config.GetSetting("enableTLS"))
+
+		if err == nil && enableTLSSetting {
+			//TLS is enabled, get server certificate & key
+			enableTLS = true
+			if _, ok := t.config.Settings["serverCert"]; !ok {
+				panic(fmt.Sprintf("No serverCert found for trigger '%s' in settings", t.config.Id))
+			}
+			serverCert = t.config.GetSetting("serverCert")
+
+			if _, ok := t.config.Settings["serverKey"]; !ok {
+				panic(fmt.Sprintf("No serverKey found for trigger '%s' in settings", t.config.Id))
+			}
+			serverKey = t.config.GetSetting("serverKey")
+		}
+	}
+
+	log.Debug("enableTLS: ", enableTLS)
+	if enableTLS {
+		log.Debug("serverCert: ", serverCert)
+		log.Debug("serverKey: ", serverKey)
+	}
+	t.enableTLS = enableTLS
+	t.serveCert = serverCert
+	t.serveKey = serverKey
 }
 
 // Metadata implements trigger.Trigger.Metadata
@@ -65,6 +114,7 @@ func (t *GRPCTrigger) Metadata() *trigger.Metadata {
 // Stop implements trigger.Trigger.Start
 func (t *GRPCTrigger) Stop() error {
 	// stop the trigger
+	t.server.GracefulStop()
 	return nil
 }
 
@@ -73,117 +123,145 @@ func (t *GRPCTrigger) Start() error {
 	// start the trigger
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Fatal(err)
+		log.Error(err)
 	}
 
-	creds, err := credentials.NewServerTLSFromFile("cert.pem", "key.pem")
-	if err != nil {
-		log.Fatal(err)
+	opts := []grpc.ServerOption{}
+
+	if t.enableTLS {
+		creds, err := credentials.NewServerTLSFromFile(t.serveCert, t.serveKey)
+		if err != nil {
+			log.Error(err)
+		}
+		opts = []grpc.ServerOption{grpc.Creds(creds)}
 	}
 
-	opts := []grpc.ServerOption{grpc.Creds(creds)}
+	t.server = grpc.NewServer(opts...)
 
-	s := grpc.NewServer(opts...)
+	servicename := t.config.GetSetting("servicename")
+	protoname := t.config.GetSetting("protoname")
+	protoname = strings.Split(protoname, ".")[0]
 
-	pb.RegisterEmployeeServiceServer(s, new(employeeService))
+	servRegFlag := false
+	if len(ServiceRegistery.ServerServices) != 0 {
+		for k, service := range ServiceRegistery.ServerServices {
+			if strings.Compare(k, protoname+servicename) == 0 {
+				log.Infof("Registered Proto [%v] and Service [%v]", protoname, servicename)
+				service.RunRegisterServerService(t.server, t)
+				servRegFlag = true
+			}
+		}
+		if !servRegFlag {
+			log.Errorf("Proto [%s] and Service [%s] not registered", protoname, servicename)
+		}
+	} else {
+		log.Error("gRPC server services not registered")
+	}
 
-	log.Println("Starting server on port: ", addr)
+	log.Debug("Starting server on port", addr)
 
 	go func() {
-		s.Serve(lis)
+		t.server.Serve(lis)
 	}()
 
-	log.Println("Server started")
+	log.Info("Server started")
+	return nil
+}
 
-	actionId := t.config.Handlers[0].ActionId
-	handlerCfg := t.config.Handlers[0]
-	action := action.Get(actionId)
+//Dispatch holds dispatch actionId and condition
+type Dispatch struct {
+	actionID   string
+	condition  string
+	handlerCfg *trigger.HandlerConfig
+}
 
-	data := map[string]interface{}{}
+//OptimizedHandler optimized handler
+type OptimizedHandler struct {
+	defaultActionID   string
+	defaultHandlerCfg *trigger.HandlerConfig
+	dispatches        []*Dispatch
+}
 
+// CreateHandlers creates handlers mapped to thier topic
+func (t *GRPCTrigger) CreateHandlers() map[string]*OptimizedHandler {
+	handlers := make(map[string]*OptimizedHandler)
+
+	for _, h := range t.config.Handlers {
+		t := h.Settings[settingDest]
+		if t == nil {
+			continue
+		}
+		dest := t.(string)
+
+		handler := handlers[dest]
+		if handler == nil {
+			handler = &OptimizedHandler{}
+			handlers[dest] = handler
+		}
+
+		if condition := h.Settings[util.Flogo_Trigger_Handler_Setting_Condition]; condition != nil {
+			dispatch := &Dispatch{
+				actionID:   h.ActionId,
+				condition:  condition.(string),
+				handlerCfg: h,
+			}
+			handler.dispatches = append(handler.dispatches, dispatch)
+		} else {
+			handler.defaultActionID = h.ActionId
+			handler.defaultHandlerCfg = h
+		}
+	}
+
+	return handlers
+}
+
+//CallHandler call to perticular handler
+func (t *GRPCTrigger) CallHandler(grpcData map[string]interface{}) (int, interface{}, error) {
+	log.Info("CallHandler method invoked")
+	// getting values from inputrequestdata and mapping it to params which can be used in different services like HTTP pathparams etc.
+	s := reflect.ValueOf(grpcData["reqdata"]).Elem()
+	typeOfT := s.Type()
+	params := make(map[string]interface{})
+	for i := 0; i < s.NumField(); i++ {
+		f := s.Field(i)
+		params[typeOfT.Field(i).Name] = f.Interface()
+	}
+
+	grpcData["servicename"] = t.config.GetSetting("servicename")
+	grpcData["protoname"] = t.config.GetSetting("protoname")
+
+	data := map[string]interface{}{
+		"params":   params,
+		"grpcData": grpcData,
+	}
+
+	//todo handle error
 	startAttrs, _ := t.metadata.OutputsToAttrs(data, false)
 
-	context := trigger.NewContextWithData(context.Background(), &trigger.ContextData{Attrs: startAttrs, HandlerCfg: handlerCfg})
+	handlers := t.config.Handlers
 
-	replyCode, replyData, err := t.runner.Run(context, action, actionId, nil)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Println("@@@@@@@@", replyCode, "data", replyData)
-
-	return nil
-}
-
-type employeeService struct{}
-
-func (s *employeeService) GetByBadgeNumber(ctx context.Context, req *pb.GetByBadgeNumberRequest) (*pb.EmployeeResponse, error) {
-
-	if md, ok := metadata.FromIncomingContext(ctx); ok {
-		fmt.Printf("metadata  received : %v\n", md)
-	}
-
-	for _, e := range employees {
-		if e.BadgeNumber == req.BadgeNumber {
-			return &pb.EmployeeResponse{Employee: &e}, nil
+	//calling perticular handler based on method name specification in gateway json file
+	for _, hand := range handlers {
+		if strings.Compare(hand.GetSetting("methodName"), grpcData["methodname"].(string)) == 0 {
+			log.Debug("Dispatch Found for ", hand.GetSetting("methodName"), " Handler Invoked: ", hand.ActionId)
+			actID := action.Get(hand.ActionId)
+			context := trigger.NewContextWithData(context.Background(), &trigger.ContextData{Attrs: startAttrs, HandlerCfg: hand})
+			replyCode, replyData, err := t.runner.Run(context, actID, hand.ActionId, nil)
+			return replyCode, replyData, err
 		}
 	}
 
-	return nil, errors.New("Employee not found")
-}
-
-func (s *employeeService) GetAll(req *pb.GetAllRequest, stream pb.EmployeeService_GetAllServer) error {
-	for _, e := range employees {
-		stream.Send(&pb.EmployeeResponse{Employee: &e})
-	}
-	return nil
-}
-
-func (s *employeeService) Save(ctx context.Context, req *pb.EmployeeRequest) (*pb.EmployeeResponse, error) {
-	return nil, nil
-}
-
-func (s *employeeService) SaveAll(stream pb.EmployeeService_SaveAllServer) error {
-
-	for {
-		emp, err := stream.Recv()
-		if err == io.EOF {
-			break
+	//calling default handler if method name not specified
+	for _, hand := range handlers {
+		if len(hand.GetSetting("methodName")) == 0 {
+			log.Debug("Default Dispatch Invoked: ", hand.ActionId)
+			actID := action.Get(hand.ActionId)
+			context := trigger.NewContextWithData(context.Background(), &trigger.ContextData{Attrs: startAttrs, HandlerCfg: hand})
+			replyCode, replyData, err := t.runner.Run(context, actID, hand.ActionId, nil)
+			return replyCode, replyData, err
 		}
-		if err != nil {
-			return err
-		}
-		employees = append(employees, *emp.Employee)
-		stream.Send(&pb.EmployeeResponse{Employee: emp.Employee})
 	}
 
-	for _, e := range employees {
-		fmt.Println(e)
-	}
-
-	return nil
-}
-
-func (s *employeeService) AddPhoto(stream pb.EmployeeService_AddPhotoServer) error {
-
-	md, ok := metadata.FromIncomingContext(stream.Context())
-	if ok {
-		fmt.Printf("recevied photo request for badge number %v \n", md["badgenumber"][0])
-	}
-
-	imageData := []byte{}
-
-	for {
-		data, err := stream.Recv()
-		if err == io.EOF {
-			fmt.Printf("filereceived with length %v \n", len(imageData))
-			return stream.Send(&pb.AddPhotoResponse{IsOk: true})
-		}
-		if err != nil {
-			return err
-		}
-		fmt.Printf("Received %v bytes \n", len(data.Data))
-		imageData = append(imageData, data.Data...)
-	}
+	log.Error("Dispatch not found")
+	return 0, nil, errors.New("Dispatch not found")
 }
